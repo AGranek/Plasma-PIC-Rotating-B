@@ -1,0 +1,245 @@
+#---------- READ ME ----------
+#-----------------------------
+
+# This is a Python 3 code
+# for a particle-in-cell simulation of plasma evolution in a strong rotating magnetic field.
+# The initial structure is a disk, evolving with time.
+
+# Three procedures are performed:
+# 1. Initialising position and velocity vectors of all bodies.
+# 2. Running (solving Poisson's equation with FFT and then gradient calculation), creating a time series. It has all densities in all frames.
+# 3. Displaying the time series, or saving it.
+#    One can display a saved time series.
+
+# Only NumPy and Matplotlib are required.
+
+# Further explanations are given in the code.
+
+# Written by Alon Granek, 2020.
+
+# ---------------------------------------------
+
+import numpy as np
+from numpy import mgrid
+import matplotlib.pyplot as mplot
+import matplotlib.animation as anim
+import matplotlib.patches as patches
+from mpl_toolkits.mplot3d import Axes3D
+import random
+import matplotlib
+mplot.Axes.tick_params(fontfamily="Century Gothic",fontsize=15,labelsize=20)
+
+#-------------------------------
+#---------- VARIABLES ----------
+#-------------------------------
+
+#### General scalar constants ####
+N = int(1e5)                # Total particle count.
+dt = 2e-9                   # Time step (sec). 
+LenUnit = 2e-3              # Length unit (m).
+
+#### State vectors ####
+Pos = np.zeros([3,N])       # Position. [x/y/z, body index]
+Vel = np.zeros([3,N])       # Velocity. [x/y/z, body index]
+Acc = np.zeros([3,N])       # Acceleration. [x/y/z, body index]
+AbsAcc = np.zeros(N)        # Acceleration magnitude. [body index]
+PosList = np.array([])      # All possible positions for bodies, in a mesh shaped as a box surrounding the plasma.
+Abs_r = np.array([])        # Distance of each of the above positions from the structure's centre.
+iChosen = np.array([])      # Indices in PosList of all possible positions that let a distance smaller than a desired radius.
+NodePos = np.zeros([3,N],dtype="int")   # The position of each body i divided by node length. Node position of each body.
+jsOutside = np.array([])    # Indices of particles that exited the Poisson's equation grid.
+jsInside = np.array([])     # Indices of particles inside the grid.
+
+#### Physical parameters ####
+CubeLen = 5e-2              # Figure cube length (m).
+TickCount = 300             # Number of nodes in each dimension.
+d = CubeLen/TickCount       # Grid spacing (m).
+e0 = 8.8e-12                # Dielectric constant. (c^2 s^2 / (kg m^3))
+Mass = 1e6 * 20 * 1.7e-27   # Mass of each macroparticle. In this example, equivalent to 10^6 neon ions (~20 AMU).
+e = 1.602e-19               # Elementary charge (c).
+Q = 1e6 * e                 # Macroparticle charge (c).
+MagField = 5                # Magnetic field magnitude (T).
+rad_per_t = 0.01            # B rotiation speed, radians per timestep.
+Vel0 = 5e4                  # Max initial particle speed (m/s).
+
+#### Related to running ####
+dtCount = 500               # Frame count.
+TimeSeries = np.zeros([TickCount,TickCount,dtCount])    # Density time series (top view). [x , y , frame index]
+TimeSeriesSide = np.zeros([TickCount,TickCount,dtCount])    # Density time series (side view). [x , y , frame index]
+
+#### Plasma particle generation parameters ####
+PlasmaCentre = np.array([0.5*CubeLen,0.5*CubeLen,0.5*CubeLen])  # Centre of plasma disk.
+PlasmaThickness = 0.5*LenUnit       # Full thickness of plasma disk.
+PlasmaRad = 2*LenUnit               # Radius of plasma disk.
+MeshInt = 1e-5                      # Body generation mesh interval. Unit distance. Allows to save PosList's memory take-up.
+
+
+#-------------------------------
+#---------- FUNCTIONS ----------
+#-------------------------------
+
+#### Place n bodies in region with given radius and centre ####
+def placeInRegion(Num,Centre,Radius):
+    global PosList,Abs_r,iChosen,Pos
+    PosList = MeshInt * mgrid[int((Centre[0]-Radius)/MeshInt):int((Centre[0]+Radius)/MeshInt) , int((Centre[1]-Radius)/MeshInt):int((Centre[1]+Radius)/MeshInt) , int((Centre[2]-0.5*PlasmaThickness)/MeshInt):int((Centre[2]+0.5*PlasmaThickness)/MeshInt)].reshape(3,-1).transpose()  # Create PosList - explained above.
+    Abs_r = np.linalg.norm(np.subtract(Centre,PosList[:]),axis=1)                           # Distance of position in PosList from the entered centre.
+    iChosen = np.array(random.sample(np.where(Abs_r <= Radius)[0].tolist() , k=int(Num)))   # Indices of positions that are within an entered radius from centre.
+    FirstZero = np.intersect1d(np.where(Pos[0,:]==0),np.intersect1d(np.where(Pos[1,:]==0),np.where(Pos[2,:]==0)))[0]    # Index of first (0,0,0) (still empty) element in Pos.
+    Pos[:,FirstZero:FirstZero+len(iChosen)] = PosList[iChosen].transpose().astype("float64")                            # Insert positions that are within the radius, into Pos on top of empty elements.
+
+
+#### Initialise positions and velocities ####
+def initialiseStates():
+    global PosList,Abs_r,iChosen,Pos,Vel
+    placeInRegion(N,PlasmaCentre,PlasmaRad)     # Generate particles.
+    Vel = Vel0 * (np.random.rand(3,N)*2 - 1)    # Set random velocities.
+    return Pos,Vel
+
+#### Find density, potential, electric field ####
+def findFields():
+    global Density,Potential,E,Pos,d,NodePos,jsOutside
+    Potential = np.zeros([TickCount,TickCount,TickCount])
+    Density = np.zeros([TickCount,TickCount,TickCount])
+    E = np.zeros([3,TickCount,TickCount,TickCount])
+    NodePos = np.divide(Pos,d*np.ones([3,N])).astype(int)
+    jsOutside = np.where(np.logical_or(NodePos >= TickCount*np.ones([3,N]) , NodePos < np.zeros([3,N])))[1]
+    ### Density: ###
+    for j in range(N):
+        if np.all(jsOutside != j):      # For each body that's not out of the density grid:
+            Density[tuple(NodePos[:,j])] += 1   # Add 1 in each body's coordinates, forming a density distribution.
+    Density[0,0,0] = 0
+    Density = Q * Density
+    ### Potential, using FT on Poisson's equation ###
+    k2 = np.linalg.norm(mgrid[:TickCount,:TickCount,:TickCount],axis=0)**2  # k^2, in Fourier space.
+    Frac = np.divide(np.fft.fftn(Density),e0*k2)                            # FT(Density)/(e0 * k^2)   = FT(Potential) 
+    Frac[0,0,0] = 0                                 # Set FT(Potential) at k=(0,0,0) as 0. This is the background potential.
+    Potential = np.abs(np.fft.ifftn( Frac ))        # Potential from FT(Potential).
+    ### Electric field ###
+    E = -np.array(np.gradient(Potential,d))         # E = -grad(Potential). [x/y/z (vals of E), X , Y , Z (position)]
+
+
+#### Return magnetic field given angle in radians ####
+def rotatedB(radians):
+    RotMatrix = np.array([[np.cos(radians),0,np.sin(radians)],[0,1,0],[-np.sin(radians),0,np.cos(radians)]])
+    B_single = np.matmul(RotMatrix,np.array([0,0,MagField]))
+    B = np.array([B_single[0]*np.ones(N),B_single[1]*np.ones(N),B_single[2]*np.ones(N)])
+    return B
+
+
+#### Find current acceleration, next velocity, next position ####
+def findVectors(t):
+    global E,NodePos
+    IsItInside = np.prod(np.logical_and(NodePos < TickCount*np.ones([3,N]) , NodePos >= np.zeros([3,N])).astype("int") , axis=0)
+    jsInside = np.where(IsItInside == 1)[0]
+    Q_M = Q / Mass
+    ### Current acceleration ###
+    Acc[:,jsInside.astype("int")] = Q_M * np.add(E[:,NodePos[0,jsInside.astype("int")],NodePos[1,jsInside.astype("int")],NodePos[2,jsInside.astype("int")]] , np.cross(Vel[:,jsInside.astype("int")],rotatedB(rad_per_t*t)[:,jsInside.astype("int")],axis=0))
+    ### Next velocity ###
+    Vel[:,jsInside.astype("int")] += Acc[:,jsInside.astype("int")]*dt
+    ### Next position ###
+    Pos[:,jsInside.astype("int")] += Vel[:,jsInside.astype("int")]*dt + 0.5*Acc[:,jsInside.astype("int")]*(dt**2)
+
+
+#### Run simulation, create time series ####
+def Run(dtCount):
+    global Density,TimeSeries,jsInRange,Pos
+    print("Initial states set. Starting to run.")
+    for t in range(dtCount-1):      # For each timestep.
+        findFields()
+        TimeSeries[:,:,t] = np.sum(Density,axis=2)    # Update time series with densities, on 2D plane.
+        TimeSeriesSide[:,:,t] = np.sum(Density,axis=1)
+        findVectors(t)
+        print(" ",(t+1),"of",dtCount,"frames loaded.",end="\r")     # Display number of loaded frames, real-time.
+
+
+#### Form a heatmap, displaying a frame in the time-series given timestep t.
+def Update(t):
+        DirB = np.divide(rotatedB(rad_per_t*t)[:,t],np.linalg.norm(rotatedB(rad_per_t*t)[:,t]))
+        arrowXY = patches.Arrow(0.1666,0.1666,0.3333*DirB[0],0.3333*DirB[1],color="w",width=0.1666)
+        arrowXZ = patches.Arrow(0.1666,0.1666,0.3333*DirB[0],0.3333*DirB[2],color="w",width=0.1666)
+        axs[0].clear()
+        axs[0].imshow(TimeSeries[:,:,t].T,cmap="inferno",extent=(0,5,5,0))
+        axs[0].set_title("Top view",fontsize=20,fontfamily="Century Gothic")
+        axs[0].set_xlabel("x (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[0].set_ylabel("y (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[0].tick_params(labelsize=15)
+        axs[0].add_patch(arrowXY)
+        axs[0].text(0.5833,0.3333,r"$\mathbf{B_{\mathit{xy}}}$",color="w",fontsize=20)
+        axs[0].text(0.3333,4.6666,r"t = " + str(round(t*dt,11)) + r" s",color="w",fontsize=15,fontfamily="Century Gothic")
+        axs[0].text(0.3333,4.3333,r"B = " + str(MagField) + r" T",color="w",fontsize=15,fontfamily="Century Gothic")
+        axs[1].clear()
+        axs[1].imshow(TimeSeriesSide[:,:,t].T,cmap="inferno",extent=(0,5,5,0))
+        axs[1].set_title("Side view",fontsize=20,fontfamily="Century Gothic")
+        axs[1].set_xlabel("x (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[1].set_ylabel("z (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[1].add_patch(arrowXZ)
+        axs[1].tick_params(labelsize=15)
+        axs[1].text(0.5833,0.3333,r"$\mathbf{B_{\mathit{xz}}}$",color="w",fontsize=20)
+
+
+#### Save created simulation ####
+# Parameter "name" holds the name (or adress with name, otherwise appears in user folder)
+def saveNewSim(name):
+    np.savetxt(name+"_Plasma_Top.txt",TimeSeries.reshape(1,1,-1)[0,0])     # Save time series in txt file.
+    np.savetxt(name+"_Plasma_Side.txt",TimeSeriesSide.reshape(1,1,-1)[0,0])     # Save time series in txt file.
+    np.savetxt(name+"_Props_Plasma.txt",np.array([N,dtCount,LenUnit]))    # Save properties (N,dtCount,LenUnit) in txt file.
+
+
+#### Load saved time series ####
+def loadSavedSim(name):
+    n,dtcount,lenunit = np.loadtxt(name+"_Props_Plasma.txt").astype(int)
+    TimeSeries = np.zeros([3,n,dtcount])
+    TimeSeries = np.loadtxt(name+"_Plasma_Top.txt").reshape(TickCount,TickCount,dtcount)
+    TimeSeriesSide = np.zeros([3,n,dtcount])
+    TimeSeriesSide = np.loadtxt(name+"_Plasma_Side.txt").reshape(TickCount,TickCount,dtcount)
+    def Update(t):
+        DirB = np.divide(rotatedB(rad_per_t*t)[:,t],np.linalg.norm(rotatedB(rad_per_t*t)[:,t]))
+        arrowXY = patches.Arrow(0.1666,0.1666,0.3333*DirB[0],0.3333*DirB[1],color="w",width=0.1666)
+        arrowXZ = patches.Arrow(0.1666,0.1666,0.3333*DirB[0],0.3333*DirB[2],color="w",width=0.1666)
+        axs[0].clear()
+        axs[0].imshow(TimeSeries[:,:,t].T,cmap="inferno",extent=(0,5,5,0))
+        axs[0].set_title("Top view",fontsize=20,fontfamily="Century Gothic")
+        axs[0].set_xlabel("x (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[0].set_ylabel("y (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[0].tick_params(labelsize=15)
+        axs[0].add_patch(arrowXY)
+        axs[0].text(0.5833,0.3333,r"$\mathbf{B_{\mathit{xy}}}$",color="w",fontsize=20)
+        axs[0].text(0.3333,4.6666,r"t = " + str(round(t*dt,11)) + r" s",color="w",fontsize=15,fontfamily="Century Gothic")
+        axs[0].text(0.3333,4.3333,r"B = " + str(MagField) + r" T",color="w",fontsize=15,fontfamily="Century Gothic")
+        axs[1].clear()
+        axs[1].imshow(TimeSeriesSide[:,:,t].T,cmap="inferno",extent=(0,5,5,0))
+        axs[1].set_title("Side view",fontsize=20,fontfamily="Century Gothic")
+        axs[1].set_xlabel("x (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[1].set_ylabel("z (cm)",fontsize=20,fontfamily="Century Gothic")
+        axs[1].add_patch(arrowXZ)
+        axs[1].tick_params(labelsize=15)
+        axs[1].text(0.5833,0.3333,r"$\mathbf{B_{\mathit{xz}}}$",color="w",fontsize=20)
+    A = anim.FuncAnimation(fig,Update,interval=80,frames=dtcount,repeat=True)          # Animate heatmap.
+    mplot.show()
+
+
+fig,axs = mplot.subplots(1,2)
+
+#--------------------------
+#---------- MAIN ----------
+#--------------------------
+
+def Main():
+    print("New simulation - '1'")
+    print("Load saved simulation - '2'")
+    Input = input()
+    if (Input == "1"):          # "New simulation" mode.
+        Pos,Vel = initialiseStates()      # Initialise states.
+        Run(dtCount)            # Form time series.
+        A = anim.FuncAnimation(fig,Update,interval=250)  # Animate and show.
+        mplot.show()
+        print("Save new simulation - '1'")  # After closing the figure window - option to save.
+        Input = input()
+        if (Input == "1"):              # If choosing option.
+            Input = input("Name: ")     # Input name. Save time series by that name.
+            saveNewSim(Input)
+    if (Input == "2"):          # "Load saved" option.
+        name = input("Name: ")  # Name.
+        loadSavedSim(name)      # Load saved time series.
+
+Main()
